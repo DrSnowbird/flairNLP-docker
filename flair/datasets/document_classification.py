@@ -11,7 +11,7 @@ from flair.data import (
     Corpus,
     Token,
     FlairDataset,
-    Tokenizer
+    Tokenizer, DataPair
 )
 from flair.tokenization import SegtokTokenizer, SpaceTokenizer
 from flair.datasets.base import find_train_dev_test_files
@@ -454,9 +454,12 @@ class CSVClassificationDataset(FlairDataset):
 
         # most data sets have the token text in the first column, if not, pass 'text' as column
         self.text_columns: List[int] = []
+        self.pair_columns: List[int] = []
         for column in column_name_map:
             if column_name_map[column] == "text":
                 self.text_columns.append(column)
+            if column_name_map[column] == "pair":
+                self.pair_columns.append(column)
 
         with open(self.path_to_file, encoding=encoding) as csv_file:
 
@@ -488,32 +491,60 @@ class CSVClassificationDataset(FlairDataset):
 
                 if self.in_memory:
 
-                    text = " ".join(
-                        [row[text_column] for text_column in self.text_columns]
-                    )
+                    sentence = self._make_labeled_data_point(row)
 
-                    if self.max_chars_per_doc > 0:
-                        text = text[: self.max_chars_per_doc]
-
-                    sentence = Sentence(text, use_tokenizer=self.tokenizer)
-
-                    for column in self.column_name_map:
-                        column_value = row[column]
-                        if (
-                                self.column_name_map[column].startswith("label")
-                                and column_value
-                        ):
-                            if column_value != self.no_class_label:
-                                sentence.add_label(label_type, column_value)
-
-                    if 0 < self.max_tokens_per_doc < len(sentence):
-                        sentence.tokens = sentence.tokens[: self.max_tokens_per_doc]
                     self.sentences.append(sentence)
 
                 else:
                     self.raw_data.append(row)
 
                 self.total_sentence_count += 1
+
+    def _make_labeled_data_point(self, row):
+
+        # make sentence from text (and filter for length)
+        text = " ".join(
+            [row[text_column] for text_column in self.text_columns]
+        )
+
+        if self.max_chars_per_doc > 0:
+            text = text[: self.max_chars_per_doc]
+
+        sentence = Sentence(text, use_tokenizer=self.tokenizer)
+
+        if 0 < self.max_tokens_per_doc < len(sentence):
+            sentence.tokens = sentence.tokens[: self.max_tokens_per_doc]
+
+        # if a pair column is defined, make a sentence pair object
+        if len(self.pair_columns) > 0:
+
+            text = " ".join(
+                [row[pair_column] for pair_column in self.pair_columns]
+            )
+
+            if self.max_chars_per_doc > 0:
+                text = text[: self.max_chars_per_doc]
+
+            pair = Sentence(text, use_tokenizer=self.tokenizer)
+
+            if 0 < self.max_tokens_per_doc < len(sentence):
+                pair.tokens = pair.tokens[: self.max_tokens_per_doc]
+
+            data_point = DataPair(first=sentence, second=pair)
+
+        else:
+            data_point = sentence
+
+        for column in self.column_name_map:
+            column_value = row[column]
+            if (
+                    self.column_name_map[column].startswith("label")
+                    and column_value
+            ):
+                if column_value != self.no_class_label:
+                    data_point.add_label(self.label_type, column_value)
+
+        return data_point
 
     def is_in_memory(self) -> bool:
         return self.in_memory
@@ -527,20 +558,7 @@ class CSVClassificationDataset(FlairDataset):
         else:
             row = self.raw_data[index]
 
-            text = " ".join([row[text_column] for text_column in self.text_columns])
-
-            if self.max_chars_per_doc > 0:
-                text = text[: self.max_chars_per_doc]
-
-            sentence = Sentence(text, use_tokenizer=self.tokenizer)
-            for column in self.column_name_map:
-                column_value = row[column]
-                if self.column_name_map[column].startswith("label") and column_value:
-                    if column_value != self.no_class_label:
-                        sentence.add_label(self.label_type, column_value)
-
-            if 0 < self.max_tokens_per_doc < len(sentence):
-                sentence.tokens = sentence.tokens[: self.max_tokens_per_doc]
+            sentence = self._make_labeled_data_point(row)
 
             return sentence
 
@@ -727,21 +745,25 @@ class IMDB(ClassificationCorpus):
             base_path: Path = Path(base_path)
 
         # this dataset name
-        dataset_name = self.__class__.__name__.lower() + '_v2'
-
-        if rebalance_corpus:
-            dataset_name = dataset_name + '-rebalanced'
+        dataset_name = self.__class__.__name__.lower() + '_v4'
 
         # default dataset folder is the cache root
         if not base_path:
             base_path = Path(flair.cache_root) / "datasets"
-        data_folder = base_path / dataset_name
 
         # download data if necessary
         imdb_acl_path = "http://ai.stanford.edu/~amaas/data/sentiment/aclImdb_v1.tar.gz"
+
+        if rebalance_corpus:
+            dataset_name = dataset_name + '-rebalanced'
+        data_folder = base_path / dataset_name
         data_path = Path(flair.cache_root) / "datasets" / dataset_name
-        data_file = data_path / "train.txt"
-        if not data_file.is_file():
+        train_data_file = data_path / "train.txt"
+        test_data_file = data_path / "test.txt"
+
+        if train_data_file.is_file()==False or (rebalance_corpus==False and test_data_file.is_file()==False):
+            [os.remove(file_path) for file_path in [train_data_file, test_data_file] if file_path.is_file()]
+
             cached_path(imdb_acl_path, Path("datasets") / dataset_name)
             import tarfile
 
@@ -765,7 +787,11 @@ class IMDB(ClassificationCorpus):
                                 if f"{dataset}/{label}" in m.name
                             ],
                         )
-                        with open(f"{data_path}/train-all.txt", "at") as f_p:
+                        data_file = train_data_file
+                        if rebalance_corpus==False and dataset=="test":
+                            data_file = test_data_file
+
+                        with open(data_file, "at") as f_p:
                             current_path = data_path / "aclImdb" / dataset / label
                             for file_name in current_path.iterdir():
                                 if file_name.is_file() and file_name.name.endswith(
